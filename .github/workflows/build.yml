@@ -1,0 +1,53 @@
+name: Build macOS app
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check release version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: test "${GITHUB_REF_NAME}" = "v$(cat VERSION)"
+      - run: bash -n install.sh scripts/*.sh
+      - run: ./scripts/build.sh
+      - name: Package
+        run: |
+          cd build
+          ditto -c -k --sequesterRsrc --keepParent LayoutFixer.app DoubleShift-${{ matrix.arch }}.zip
+          shasum -a 256 DoubleShift-${{ matrix.arch }}.zip > DoubleShift-${{ matrix.arch }}.zip.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DoubleShift-${{ matrix.arch }}
+          path: |
+            build/*.zip
+            build/*.sha256
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release create "$GITHUB_REF_NAME" artifacts/* --draft --generate-notes --title "Double Shift $GITHUB_REF_NAME"
