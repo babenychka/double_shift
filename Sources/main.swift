@@ -2,6 +2,11 @@ import Cocoa
 import Carbon.HIToolbox
 import ApplicationServices
 
+func diagnosticLog(_ message: String) {
+    let line = "[DoubleShift] \(Date()) pid=\(getpid()) \(message)\n"
+    FileHandle.standardError.write(Data(line.utf8))
+}
+
 // ─────────── настройки: defaults write com.local.layoutfixer KEY -float N ───────────
 private let ud = UserDefaults.standard
 private func cfg(_ k: String, _ def: Double) -> Double {
@@ -200,7 +205,7 @@ func textLikeDescendants(_ root: AXUIElement, maxDepth: Int = 6, limit: Int = 4)
 }
 let AXRoleTextField = "AXTextField"
 
-func selectionCandidates() -> [AXUIElement] {
+func selectionCandidates(includeDescendants: Bool = true) -> [AXUIElement] {
     var list: [AXUIElement] = []
     let sys = AXUIElementCreateSystemWide()
     AXUIElementSetMessagingTimeout(sys, axTimeoutRead)
@@ -211,7 +216,8 @@ func selectionCandidates() -> [AXUIElement] {
         let app = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(app, axTimeoutRead)
         if let f = axElement(app, kAXFocusedUIElementAttribute as String) { list.append(f) }
-        if let w = axElement(app, kAXFocusedWindowAttribute as String), !role(w).isEmpty {
+        if includeDescendants,
+           let w = axElement(app, kAXFocusedWindowAttribute as String), !role(w).isEmpty {
             list.append(contentsOf: textLikeDescendants(w))          // сюда попадает AXWebArea
         }
     }
@@ -245,9 +251,23 @@ func selectedText(_ el: AXUIElement) -> String? {
 func readSelection(retries: Int) -> (AXUIElement, String)? {
     for attempt in 0...max(0, retries) {
         if attempt > 0 { AXWaker.shared.wakeSync(); usleep(retryDelayUS) }
-        for el in selectionCandidates() {
+        // Сначала читаем фокус: обход AX-дерева браузера может занимать секунды.
+        let focused = selectionCandidates(includeDescendants: false)
+        for el in focused {
             if let s = selectedText(el), !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 return (el, s)
+            }
+        }
+        let pid = Front.shared.pid
+        if pid > 0 {
+            let app = AXUIElementCreateApplication(pid)
+            AXUIElementSetMessagingTimeout(app, axTimeoutRead)
+            if let window = axElement(app, kAXFocusedWindowAttribute as String) {
+                for el in textLikeDescendants(window) where !focused.contains(where: { CFEqual($0, el) }) {
+                    if let s = selectedText(el), !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        return (el, s)
+                    }
+                }
             }
         }
     }
@@ -282,17 +302,27 @@ func postKey(_ code: CGKeyCode, _ d: UInt32) {
 
 func typeString(_ s: String, _ d: UInt32) {
     let src = CGEventSource(stateID: .privateState)
-    for scalar in s.unicodeScalars {
-        var u = UniChar(scalar.value)
+    // CGEvent принимает строку UTF-16 целиком. Небольшие блоки совместимы
+    // с браузерами и не требуют отдельной паузы на каждую букву.
+    let units = Array(s.utf16)
+    var offset = 0
+    while offset < units.count {
+        var end = min(offset + 20, units.count)
+        // Не разрываем суррогатную пару между событиями.
+        if end < units.count, (0xD800...0xDBFF).contains(units[end - 1]) { end -= 1 }
+        let chunk = Array(units[offset..<end])
         for down in [true, false] {
             guard let e = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: down) else { continue }
             e.flags = []
-            e.keyboardSetUnicodeString(stringLength: 1, unicodeString: &u)
+            chunk.withUnsafeBufferPointer { buffer in
+                e.keyboardSetUnicodeString(stringLength: buffer.count, unicodeString: buffer.baseAddress!)
+            }
             e.setIntegerValueField(.eventSourceUserData, value: myMarker)
             e.post(tap: .cghidEventTap)
             usleep(d / 2)
         }
         usleep(d)
+        offset = end
     }
 }
 
@@ -330,7 +360,7 @@ final class Switcher {
                 let wasTap = !otherKeyUsed && (now - shiftDownAt) < tapMax
                 if wasTap && (now - lastTapAt) < doubleMax {
                     lastTapAt = 0
-                    if enabled { queue.async { self.fix() } }
+                    if enabled { diagnosticLog("double Shift received"); queue.async { self.fix() } }
                 } else {
                     lastTapAt = wasTap ? now : 0
                 }
@@ -393,6 +423,7 @@ final class Switcher {
     // MARK: fix
 
     private func fix() {
+        diagnosticLog("fix started; accessibility=\(AXIsProcessTrusted()) listen=\(CGPreflightListenEventAccess()) post=\(CGPreflightPostEventAccess())")
         let d = synthDelay()
         let slow = Front.shared.isSlow
         let now = CACurrentMediaTime()
@@ -406,7 +437,6 @@ final class Switcher {
 
         // ── 1. выделение. Если только что печатали и есть что править — AX вообще не трогаем (мгновенно)
         if !(recentTyping && !t.isEmpty) {
-            if slow { AXWaker.shared.wakeSync() }
             // повторы только когда без выделения нам всё равно останется только beep
             if let (el, sel) = readSelection(retries: haveFallback ? 0 : maxRetries) {
                 let dir = direction(of: sel)
@@ -475,6 +505,21 @@ func tapCallback(proxy: CGEventTapProxy, type: CGEventType,
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
+    private var permissionTimer: Timer?
+    private var permissionState = ""
+
+    private func checkPermissions() {
+        let trusted = AXIsProcessTrusted()
+        let listen = CGPreflightListenEventAccess()
+        let post = CGPreflightPostEventAccess()
+        let state = "accessibility=\(trusted) listen=\(listen) post=\(post)"
+        if state != permissionState {
+            permissionState = state
+            diagnosticLog("permissions: \(state); executable=\(Bundle.main.executablePath ?? "unknown")")
+        }
+        if tapPort == nil && (listen || trusted) { startTap() }
+        statusItem.button?.title = trusted && tapPort != nil ? (Switcher.shared.enabled ? "⇧⇧" : "⇧") : "⇧⇧!"
+    }
 
     func applicationDidFinishLaunching(_ n: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -496,6 +541,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         AXWaker.shared.start()
         startTap()
+        checkPermissions()
+        permissionTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            self?.checkPermissions()
+        }
     }
 
     @objc func toggle(_ item: NSMenuItem) {
@@ -539,13 +588,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let port = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap,
                                            options: .listenOnly, eventsOfInterest: CGEventMask(mask),
                                            callback: tapCallback, userInfo: nil) else {
-            print("tapCreate failed — нет Accessibility"); return
+            diagnosticLog("event tap creation failed"); return
         }
         tapPort = port
         let src = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, port, 0)
         CFRunLoopAddSource(CFRunLoopGetMain(), src, .commonModes)
         CGEvent.tapEnable(tap: port, enable: true)
-        print("tap started")
+        diagnosticLog("event tap started")
     }
 }
 

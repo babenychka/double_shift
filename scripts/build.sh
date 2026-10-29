@@ -14,7 +14,9 @@ cp "$ROOT/Info.plist" "$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $VERSION" "$APP/Contents/Info.plist"
 export MACOSX_DEPLOYMENT_TARGET=12.0
-xcrun swiftc -O -module-cache-path "$ROOT/build/module-cache" "$ROOT/Sources/main.swift" \
+# PCM-файлы содержат абсолютный путь кеша. Свежий кеш в staging-папке
+# позволяет собирать проект после переноса или копирования репозитория.
+xcrun swiftc -O -module-cache-path "$STAGE/module-cache" "$ROOT/Sources/main.swift" \
   -o "$APP/Contents/MacOS/LayoutFixer" -framework Cocoa -framework Carbon -framework ApplicationServices
 codesign --force --sign "${SIGN_IDENTITY:--}" "$APP"
 codesign --verify --strict "$APP"
